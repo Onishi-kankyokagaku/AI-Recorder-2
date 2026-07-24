@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8">
+    <title>AI議事録レコーダー</title>
+<style>
+    /* 録音中のボタン：深みのある光と鼓動 */
+    .recording-active {
+        background: linear-gradient(135.2deg, #4CAF50 1.2%, #81C784 98.8%) !important;
+        position: relative;
+        border: none;
+        outline: none;
+        box-shadow: 0 0 15px rgba(76, 175, 80, 0.6), 0 0 30px rgba(76, 175, 80, 0.4);
+        animation: living-pulse 2.5s infinite ease-in-out;
+    }
+
+    @keyframes living-pulse {
+        0% { transform: scale(1); filter: brightness(1); box-shadow: 0 0 0 0 rgba(76, 175, 80, 0.7); }
+        40% { transform: scale(1.03); filter: brightness(1.2); box-shadow: 0 0 0 25px rgba(76, 175, 80, 0); }
+        100% { transform: scale(1); filter: brightness(1); box-shadow: 0 0 0 0 rgba(76, 175, 80, 0); }
+    }
+    
+    #stop:not(:disabled) { animation: stop-alert 2s infinite; }
+    @keyframes stop-alert { 0% { opacity: 1; } 50% { opacity: 0.8; } 100% { opacity: 1; } }
+    
+    body { font-family: sans-serif; text-align: center; padding: 40px 15px; background: #f4f7f6; margin: 0 auto; max-width: 500px; }
+    #version-tag { text-align: right; font-size: 0.7rem; color: #999; background: #eee; padding: 2px 8px; border-radius: 10px; display: inline-block; }
+    .ver-container { text-align: right; margin-bottom: 10px; }
+    h1 { font-size: 1.5rem; color: #333; margin-bottom: 30px; }
+
+    button { font-size: 1.2rem; padding: 20px; margin: 10px 0; border: none; border-radius: 12px; cursor: pointer; transition: 0.3s; width: 100%; max-width: 400px; display: block; margin-left: auto; margin-right: auto; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+    #start { background: #4CAF50; color: white; font-weight: bold; }
+    #stop { background: #f44336; color: white; font-weight: bold; }
+    button:active { transform: translateY(2px); box-shadow: none; }
+    button:disabled { background: #ccc; cursor: not-allowed; box-shadow: none; }
+
+    #status { margin-top: 30px; color: #555; font-size: 0.9rem; line-height: 1.6; word-wrap: break-word; text-align: left; background: white; padding: 15px; border-radius: 10px; border: 1px solid #ddd; max-width: 400px; margin-left: auto; margin-right: auto; }
+    .ss-link { display: block; margin-top: 15px; padding: 15px; background: #4285f4; color: white; text-decoration: none; border-radius: 8px; font-weight: bold; text-align: center; }
+
+    .system-error { background: #ffebee !important; animation: error-flash 1.2s infinite alternate ease-in-out; }
+    @keyframes error-flash { 0% { background: #ffebee; } 100% { background: #ffcdd2; } }
+    .error-status-text { color: #d32f2f !important; border: 3px solid #d32f2f !important; background: #ffffff !important; box-shadow: 0 0 15px rgba(211, 47, 47, 0.2) !important; }
+
+    .qr-container { margin: 20px auto; padding: 15px; background: white; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: inline-block; text-align: center; }
+    .qr-container svg { display: block; margin: 0 auto; width: 200px; height: 200px; }
+</style>
+</head>
+<body>
+    <div class="ver-container">
+        <span id="version-tag">Ver. 1.1.12</span>
+    </div>
+
+    <h1>AI議事録レコーダー</h1>
+    <button id="start">● 録音開始</button>
+    <button id="stop" disabled>■ 停止・議事録作成</button>
+    <p id="status">ステータス: 準備完了</p>
+
+    <audio id="silent-audio" loop>
+        <source src="data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=" type="audio/wav">
+    </audio>
+
+<script>
+    const GAS_URL = "https://script.google.com/macros/s/AKfycbzRs43RG0F6uvofvO0ircI5-rRSglx2gYBfN6ja8GuP1DpmL3ZDmKmUHmBe12sI947Pdg/exec";
+    
+    let currentSsId = null; 
+    let currentSsUrl = null; 
+    let currentLogRow = null; 
+    let rec = null, timer = null, audioCtx = null;
+    let isFinalAction = false;
+    let worker = null;
+    let sendCount = 0; 
+    let wakeLock = null;
+
+    const status = document.getElementById('status');
+    const startBtn = document.getElementById('start');
+    const stopBtn = document.getElementById('stop');
+    const silentAudio = document.getElementById('silent-audio');
+
+    let isSending = false;
+
+    startBtn.disabled = true;
+    status.innerHTML = "システム初期化中（スプレッドシート作成中）...";
+
+    function log(msg) {
+        console.log(msg);
+        status.innerHTML += `<br><span style="color:blue;font-size:0.8rem;">[Log] ${msg}</span>`;
+    }
+
+    const requestWakeLock = async () => {
+        try {
+            if ('wakeLock' in navigator) {
+                wakeLock = await navigator.wakeLock.request('screen');
+                log("画面スリープ防止：有効");
+                wakeLock.addEventListener('release', () => { log("画面スリープ防止：解除されました"); });
+            }
+        } catch (err) {
+            log(`WakeLockエラー: ${err.name}, ${err.message}`);
+        }
+    };
+
+    function triggerNetworkErrorScreen(type, errorMsg) {
+        log(`通信エラー発生 (${type}): ${errorMsg}`);
+        document.body.classList.add('system-error');
+        status.classList.add('error-status-text');
+        status.innerHTML = `
+            <div style="text-align:center; padding: 10px;">
+                <span style="font-size: 1.8rem; font-weight: bold;">⚠️ 通信エラー発生 (${type})</span><br><br>
+                <strong style="color:#d32f2f; font-size: 1.1rem;">データの送信・接続に失敗しました。</strong><br>
+                <span style="font-size:0.9rem; color:#333;">電波環境の良い場所へ移動するか、Wi-Fiを確認してください。</span>
+            </div>
+            <hr style="border: 0; border-top: 1px solid #d32f2f; margin: 15px 0;">
+            <span style="font-size:0.75rem; color:#777;">[エラー詳細]: ${errorMsg}</span>
+        `;
+        clearInterval(timer);
+        if (rec && rec.state !== "inactive") {
+            rec.stop();
+            rec.stream.getTracks().forEach(track => track.stop());
+        }
+        if (silentAudio) { silentAudio.pause(); silentAudio.currentTime = 0; }
+        startBtn.classList.remove('recording-active');
+        startBtn.innerText = "● 録音停止（エラー検出）";
+    }
+    
+    // ⬇️ 【超軽量・外部依存なし】JavaScriptだけで安全にQR(SVG)を作る関数
+    function generateQRishest(text) {
+        const url = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(text)}`;
+        return `<img src="${url}" width="200" height="200" alt="QR Code" style="display:block; margin:0 auto; border:none;">`;
+    }
+
+    worker = new Worker('worker.js');
+    worker.onmessage = (e) => {
+        const data = e.data;
+        if (data.type === 'memo' || data.type === 'final' || data.type === 'recording') isSending = false;
+
+        if (data.status === 'success') {
+            if (data.type === 'init') {
+                currentSsId = data.result.ssId;
+                currentSsUrl = data.result.url; 
+                currentLogRow = data.result.logRow;
+                startBtn.disabled = false;
+                status.innerHTML = "準備完了";
+                log("スプレッドシートを確保しました");
+                return;
+            }
+            
+            if (data.type === 'final') {
+                // 確実に表示できる外部API経由のクリーンな画像生成タグを使用
+                const qrHtml = generateQRishest(currentSsUrl);
+                
+                status.innerHTML = `
+                    <h3>✨ 議事録が完成しました</h3>
+                    <a href="${currentSsUrl}" target="_blank" class="ss-link">議事録を確認する ↗</a>
+                    <div class="qr-container">
+                        <p style="margin: 0 0 10px 0; font-size: 0.85rem; color: #333; font-weight: bold;">
+                            📸 PCやスマホでスキャンして手元で開く
+                        </p>
+                        ${qrHtml}
+                    </div>
+                    <p style="margin-top: 15px; font-size: 0.9rem; color: #666;">※議事録上部のボタンからダウンロード可能です。</p>
+                `;
+                log("全工程が完了しました。");
+
+                silentAudio.pause();
+                silentAudio.currentTime = 0;
+                if (wakeLock !== null) { wakeLock.release().then(() => { wakeLock = null; }); }                
+                window.onbeforeunload = null;
+            } else if (data.type === 'memo') {
+                log(`No.${data.index} 転記完了`);
+            }
+        } else {
+            log(`エラー (${data.type}): ${data.error}`);
+            triggerNetworkErrorScreen(data.type, data.error);
+        }
+    };
+
+    window.onload = () => {
+        log("SS発行リクエスト送信...");
+        worker.postMessage({ type: 'init', gasUrl: GAS_URL });
+    };
+
+    const startSegment = async (stream) => {
+        let chunks = [];
+        rec = new MediaRecorder(stream);
+        rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+        
+        rec.onstop = async () => {
+            if (isSending) {
+                log("前回の送信が完了するのを待っています...");
+                setTimeout(() => rec.onstop(), 10000);
+                return;
+            }
+            if (chunks.length === 0) return;
+    
+            sendCount++; 
+            let currentIndex = sendCount; 
+            let sendType = isFinalAction ? "final" : "memo"; 
+    
+            const blob = new Blob(chunks, { type: 'audio/webm' });
+            const arrayBuffer = await blob.arrayBuffer();
+            
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            audioCtx.decodeAudioData(arrayBuffer, (buffer) => {
+                log(`No.${currentIndex} 送信開始...`);
+                isSending = true; 
+                const floatArray = buffer.getChannelData(0);
+                worker.postMessage({
+                    floatArray: floatArray,
+                    sampleRate: buffer.sampleRate,
+                    type: sendType,
+                    index: currentIndex,
+                    gasUrl: GAS_URL,
+                    ssId: currentSsId,
+                    logRow: currentLogRow
+                }, [floatArray.buffer]);
+                if (!isFinalAction) startSegment(stream);
+            });
+        };
+        rec.start();
+    };
+
+    startBtn.onclick = async () => {
+        startBtn.classList.add('recording-active');
+        startBtn.innerText = "● 録音中..."; 
+        await requestWakeLock();
+
+        window.onbeforeunload = (e) => {
+            e.preventDefault();
+            return "録音中にページを離れるとデータが失われます。";
+        };
+
+        if (currentLogRow) { worker.postMessage({ type: 'recording', gasUrl: GAS_URL, logRow: currentLogRow }); }
+        try {
+            isFinalAction = false;
+            sendCount = 0; 
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            silentAudio.play();
+            startSegment(stream);
+
+            timer = setInterval(() => {
+                if (rec && rec.state === "recording") rec.stop();
+            }, 180000); 
+
+            startBtn.disabled = true;
+            stopBtn.disabled = false;
+            status.innerHTML = "録音中...";
+        } catch (err) {
+            log("開始エラー: " + err.message);
+        }
+    };
+
+    stopBtn.onclick = async () => {
+        isFinalAction = true;
+        startBtn.classList.remove('recording-active');
+        startBtn.innerText = "● 録音開始";
+        clearInterval(timer);
+        if (rec && rec.state !== "inactive") {
+            rec.stop();
+            rec.stream.getTracks().forEach(track => track.stop());
+        }
+        status.innerHTML = "最終データを解析中...";
+        stopBtn.disabled = true;
+    };
+
+    document.addEventListener('visibilitychange', async () => {
+        if (wakeLock !== null && document.visibilityState === 'visible') { await requestWakeLock(); }
+    });
+</script>
+</body>
+</html>
