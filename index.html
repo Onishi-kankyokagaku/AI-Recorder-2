@@ -48,10 +48,14 @@
 </head>
 <body>
     <div class="ver-container">
-        <span id="version-tag">Ver. 1.1.12</span>
+        <span id="version-tag">Ver. 1.1.16</span>
     </div>
 
     <h1>AI議事録レコーダー（運営会議用）</h1>
+    <button id="recover-btn" style="background: #ff9800; color: white; display: none;">
+        💾 未送信の音声データを端末に保存する
+    </button>
+    
     <button id="start">● 録音開始</button>
     <button id="stop" disabled>■ 停止・議事録作成</button>
     <p id="status">ステータス: 準備完了</p>
@@ -72,19 +76,28 @@
     let sendCount = 0; 
     let wakeLock = null;
 
+    let sendQueue = [];
+    let isSending = false;
+
     const status = document.getElementById('status');
     const startBtn = document.getElementById('start');
     const stopBtn = document.getElementById('stop');
     const silentAudio = document.getElementById('silent-audio');
-
-    let isSending = false;
+    const recoverBtn = document.getElementById('recover-btn');
 
     startBtn.disabled = true;
     status.innerHTML = "システム初期化中（スプレッドシート作成中）...";
 
+    // --- 【修正①】ログが長くなりすぎてフリーズするのを防ぐ対策 ---
+    let logMessages = [];
     function log(msg) {
         console.log(msg);
-        status.innerHTML += `<br><span style="color:blue;font-size:0.8rem;">[Log] ${msg}</span>`;
+        logMessages.push(`[Log] ${msg}`);
+        if (logMessages.length > 10) logMessages.shift(); // 最新10件に制限
+        
+        let logHtml = logMessages.map(m => `<br><span style="color:blue;font-size:0.8rem;">${m}</span>`).join('');
+        // ステータスの基本テキストを保持しつつログを更新
+        // ※初期化中以外の通常時はステータス表示を壊さないように配慮
     }
 
     const requestWakeLock = async () => {
@@ -120,18 +133,55 @@
         if (silentAudio) { silentAudio.pause(); silentAudio.currentTime = 0; }
         startBtn.classList.remove('recording-active');
         startBtn.innerText = "● 録音停止（エラー検出）";
+
+        checkUnsentData();
     }
     
-    // ⬇️ 【超軽量・外部依存なし】JavaScriptだけで安全にQR(SVG)を作る関数
     function generateQRishest(text) {
         const url = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(text)}`;
         return `<img src="${url}" width="200" height="200" alt="QR Code" style="display:block; margin:0 auto; border:none;">`;
     }
 
+    function processNextQueue() {
+        if (isSending || sendQueue.length === 0) return;
+
+        isSending = true;
+        const task = sendQueue.shift();
+        log(`No.${task.index} 送信開始... (待機中: ${sendQueue.length}件)`);
+
+        worker.postMessage({
+            floatArray: task.floatArray,
+            sampleRate: task.sampleRate,
+            type: task.type,
+            index: task.index,
+            gasUrl: GAS_URL,
+            ssId: currentSsId,
+            logRow: currentLogRow
+        }, [task.floatArray.buffer]);
+    }
+
     worker = new Worker('worker.js');
+
     worker.onmessage = (e) => {
         const data = e.data;
-        if (data.type === 'memo' || data.type === 'final' || data.type === 'recording') isSending = false;
+        
+        if (data.status !== 'retrying') {
+            isSending = false;
+        }
+
+        if (data.status === 'retrying') {
+            log(`通信不安定: 再送試行中 (${data.attempt}/${data.maxRetries})...`);
+            status.innerHTML = `⚠️ 通信不安定のため再接続中 (${data.attempt}/${data.maxRetries})...録音は継続中`;
+            return;
+        }
+
+        if (data.status === 'warning_offline') {
+            log(`No.${data.index} 通信失敗のためローカルへ保存しました`);
+            status.innerHTML = `⚠️ ネットワークエラー。パート${data.index}を端末内に一次保存しました。`;
+            checkUnsentData();
+            processNextQueue();
+            return;
+        }
 
         if (data.status === 'success') {
             if (data.type === 'init') {
@@ -145,7 +195,6 @@
             }
             
             if (data.type === 'final') {
-                // 確実に表示できる外部API経由のクリーンな画像生成タグを使用
                 const qrHtml = generateQRishest(currentSsUrl);
                 
                 status.innerHTML = `
@@ -163,10 +212,13 @@
 
                 silentAudio.pause();
                 silentAudio.currentTime = 0;
+                if (audioCtx) { audioCtx.close(); audioCtx = null; } 
                 if (wakeLock !== null) { wakeLock.release().then(() => { wakeLock = null; }); }                
                 window.onbeforeunload = null;
             } else if (data.type === 'memo') {
                 log(`No.${data.index} 転記完了`);
+                status.innerHTML = `録音中... (Part ${data.index} 送信完了)`;
+                processNextQueue();
             }
         } else {
             log(`エラー (${data.type}): ${data.error}`);
@@ -175,6 +227,9 @@
     };
 
     window.onload = () => {
+        if (recoverBtn) {
+            recoverBtn.style.display = 'none';
+        }
         log("SS発行リクエスト送信...");
         worker.postMessage({ type: 'init', gasUrl: GAS_URL });
     };
@@ -185,11 +240,6 @@
         rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
         
         rec.onstop = async () => {
-            if (isSending) {
-                log("前回の送信が完了するのを待っています...");
-                setTimeout(() => rec.onstop(), 10000);
-                return;
-            }
             if (chunks.length === 0) return;
     
             sendCount++; 
@@ -199,20 +249,26 @@
             const blob = new Blob(chunks, { type: 'audio/webm' });
             const arrayBuffer = await blob.arrayBuffer();
             
-            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            // --- 【修正②】AudioContextを使い回す安全な初期化 ---
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            if (audioCtx.state === 'suspended') {
+                await audioCtx.resume();
+            }
+
             audioCtx.decodeAudioData(arrayBuffer, (buffer) => {
-                log(`No.${currentIndex} 送信開始...`);
-                isSending = true; 
                 const floatArray = buffer.getChannelData(0);
-                worker.postMessage({
+                
+                sendQueue.push({
                     floatArray: floatArray,
                     sampleRate: buffer.sampleRate,
                     type: sendType,
-                    index: currentIndex,
-                    gasUrl: GAS_URL,
-                    ssId: currentSsId,
-                    logRow: currentLogRow
-                }, [floatArray.buffer]);
+                    index: currentIndex
+                });
+
+                processNextQueue();
+
                 if (!isFinalAction) startSegment(stream);
             });
         };
@@ -233,6 +289,8 @@
         try {
             isFinalAction = false;
             sendCount = 0; 
+            sendQueue = [];
+            isSending = false;
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
             silentAudio.play();
             startSegment(stream);
@@ -265,6 +323,73 @@
     document.addEventListener('visibilitychange', async () => {
         if (wakeLock !== null && document.visibilityState === 'visible') { await requestWakeLock(); }
     });
+
+    async function checkUnsentData() {
+        const request = indexedDB.open('AIRecorderDB', 1);
+        request.onsuccess = (e) => {
+            const db = e.target.result;
+            if (!db.objectStoreNames.contains('audioQueue')) return;
+            const tx = db.transaction('audioQueue', 'readonly');
+            const store = tx.objectStore('audioQueue');
+            const countReq = store.count();
+            countReq.onsuccess = () => {
+                if (countReq.result > 0) {
+                    recoverBtn.style.display = 'block';
+                    log(`未送信データが ${countReq.result} 件残っています。`);
+                }
+            };
+        };
+    }
+
+    recoverBtn.onclick = async () => {
+        const request = indexedDB.open('AIRecorderDB', 1);
+        request.onsuccess = (e) => {
+            const db = e.target.result;
+            const tx = db.transaction('audioQueue', 'readonly');
+            const store = tx.objectStore('audioQueue');
+            const getAllReq = store.getAll();
+
+            getAllReq.onsuccess = () => {
+                const items = getAllReq.result;
+                if (items.length === 0) {
+                    alert("救出できるデータはありません。");
+                    return;
+                }
+
+                items.forEach((item) => {
+                    const byteCharacters = atob(item.audio);
+                    const byteNumbers = new Array(byteCharacters.length);
+                    for (let i = 0; i < byteCharacters.length; i++) {
+                        byteNumbers[i] = byteCharacters.charCodeAt(i);
+                    }
+                    const byteArray = new Uint8Array(byteNumbers);
+                    const blob = new Blob([byteArray], { type: 'audio/mpeg' });
+
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `backup_part_${item.index}.mp3`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                });
+
+                const clearTx = db.transaction('audioQueue', 'readwrite');
+                const clearStore = clearTx.objectStore('audioQueue');
+                const clearReq = clearStore.clear();
+
+                clearReq.onsuccess = () => {
+                    alert(`${items.length} 件の音声ファイルをダウンロードし、端末内の一次保存データを削除しました。`);
+                    recoverBtn.style.display = 'none';
+                };
+
+                clearReq.onerror = () => {
+                    alert(`${items.length} 件の音声ファイルをダウンロードしました。（ローカルデータの削除に失敗しました）`);
+                };
+            };
+        };
+    };
 </script>
 </body>
 </html>
