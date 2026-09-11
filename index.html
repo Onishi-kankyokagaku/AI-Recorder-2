@@ -48,7 +48,7 @@
 </head>
 <body>
     <div class="ver-container">
-        <span id="version-tag">Ver. 1.1.16</span>
+        <span id="version-tag">Ver. 1.1.17</span>
     </div>
 
     <h1>AI議事録レコーダー（運営会議用）</h1>
@@ -272,7 +272,7 @@
                 if (!isFinalAction) startSegment(stream);
             });
         };
-        rec.start();
+        rec.start(1000);
     };
 
     startBtn.onclick = async () => {
