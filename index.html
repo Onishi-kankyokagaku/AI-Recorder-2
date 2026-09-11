@@ -227,6 +227,11 @@
     };
 
     window.onload = () => {
+        
+        // 起動時に一瞬だけ大きなメモリダミー領域を確保して破棄し、V8の清掃モードを起動する
+        let dummy = new ArrayBuffer(100 * 1024 * 1024); // 100MBのダミー
+        dummy = null; // 即座に参照を切って清掃対象にする
+        
         if (recoverBtn) {
             recoverBtn.style.display = 'none';
         }
