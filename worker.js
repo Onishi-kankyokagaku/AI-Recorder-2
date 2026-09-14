@@ -132,6 +132,8 @@ self.onmessage = async (e) => {
             result: result 
         });
     } catch (error) {
+        // ★修正ポイント：6回のリトライが失敗した場合は、完全に通信諦めモードに入る。
+        // GASへは何も送信せず、ローカル保存を残したままメインスレッドへ報告する。
         self.postMessage({ 
             status: 'warning_offline', 
             type: type, 
@@ -164,14 +166,12 @@ function encodeMP3(samples, sampleRate) {
     return result.buffer;
 }
 
-// ★最適化：32KBずつのチャンク変換により文字列連結時のメモリ急増を抑える
 function arrayBufferToBase64(buffer) {
     let binary = '';
     const bytes = new Uint8Array(buffer);
     const len = bytes.byteLength;
-    const chunkSize = 0x8000;
-    for (let i = 0; i < len; i += chunkSize) {
-        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
     }
     return btoa(binary);
 }
