@@ -3,7 +3,7 @@
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta charset="UTF-8">
-    <title>AI議事録レコーダー（運営会議用）</title>
+    <title>AI議事録レコーダー</title>
 <style>
     /* 録音中のボタン：深みのある光と鼓動 */
     .recording-active {
@@ -48,10 +48,10 @@
 </head>
 <body>
     <div class="ver-container">
-        <span id="version-tag">Ver. 1.1.17</span>
+        <span id="version-tag">Ver. 1.1.18</span>
     </div>
 
-    <h1>AI議事録レコーダー（運営会議用）</h1>
+    <h1>AI議事録レコーダー</h1>
     <button id="recover-btn" style="background: #ff9800; color: white; display: none;">
         💾 未送信の音声データを端末に保存する
     </button>
@@ -66,7 +66,7 @@
     </audio>
 
 <script>
-    const GAS_URL = "https://script.google.com/macros/s/AKfycbzRs43RG0F6uvofvO0ircI5-rRSglx2gYBfN6ja8GuP1DpmL3ZDmKmUHmBe12sI947Pdg/exec";
+    const GAS_URL = "https://script.google.com/macros/s/AKfycbwnThA6GO1XmW9ub9GnIYKNZGl23tPAqheTpRo5MGAtrw3iJpSwv_GKRmQqJmZML65m/exec";
     
     let currentSsId = null; 
     let currentSsUrl = null; 
@@ -94,6 +94,51 @@
         logMessages.push(`[Log] ${msg}`);
         if (logMessages.length > 10) logMessages.shift();
     }
+
+    // --- IndexedDB リアルタイムストリーミング領域 ---
+    const RAW_DB_NAME = 'AIRecorderRawDB';
+    const RAW_STORE_NAME = 'rawChunks';
+
+    function openRawDB() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(RAW_DB_NAME, 1);
+            req.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains(RAW_STORE_NAME)) {
+                    db.createObjectStore(RAW_STORE_NAME, { autoIncrement: true });
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    async function appendRawChunk(blob) {
+        try {
+            const db = await openRawDB();
+            const tx = db.transaction(RAW_STORE_NAME, 'readwrite');
+            tx.objectStore(RAW_STORE_NAME).add(blob);
+        } catch (err) {
+            log("生データストリーミング保存失敗: " + err.message);
+        }
+    }
+
+    async function popAllRawChunks() {
+        const db = await openRawDB();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(RAW_STORE_NAME, 'readwrite');
+            const store = tx.objectStore(RAW_STORE_NAME);
+            const getAllReq = store.getAll();
+
+            getAllReq.onsuccess = () => {
+                const blobs = getAllReq.result || [];
+                store.clear(); // 読み出し後、ディスク領域を即座に削除・解放
+                resolve(blobs);
+            };
+            getAllReq.onerror = () => reject(getAllReq.error);
+        });
+    }
+    // ------------------------------------------------
 
     const requestWakeLock = async () => {
         try {
@@ -222,11 +267,7 @@
     };
 
     window.onload = () => {
-        
-        // 起動時に一瞬だけ大きなメモリダミー領域を確保して破棄し、V8の清掃モードを起動する
-        let dummy = new ArrayBuffer(500 * 1024 * 1024); // 100MBのダミー
-        dummy = null; // 即座に参照を切って清掃対象にする
-        
+        // ★最適化：V8に過度な負荷を与える巨大ArrayBufferダミー確保を削除
         if (recoverBtn) {
             recoverBtn.style.display = 'none';
         }
@@ -235,32 +276,33 @@
     };
 
     const startSegment = async (stream) => {
-        let chunks = [];
         rec = new MediaRecorder(stream);
-        rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+        
+        // ★核心改修：1秒ごとに届くチャンクをメモリ上の配列に一切溜め込まず、即座にIndexedDB（ディスク）へ逃がす
+        rec.ondataavailable = (e) => { 
+            if (e.data.size > 0) {
+                appendRawChunk(e.data); 
+            }
+        };
         
         rec.onstop = async () => {
-            if (chunks.length === 0) return;
+            // ディスク（IndexedDB）から1秒ごとに蓄積したWebMチャンクを一括取得し、DB内を即座に空にする
+            const rawBlobs = await popAllRawChunks();
+            if (rawBlobs.length === 0) return;
 
             sendCount++; 
             let currentIndex = sendCount; 
             let sendType = isFinalAction ? "final" : "memo"; 
 
-            const blob = new Blob(chunks, { type: 'audio/webm' });
-            chunks = []; // メモリ解放
-
+            const blob = new Blob(rawBlobs, { type: 'audio/webm' });
             const arrayBuffer = await blob.arrayBuffer();
             
             if (!isFinalAction) setTimeout(() => startSegment(stream), 0);
 
-            if (!audioCtx) {
-                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-            }
-            if (audioCtx.state === 'suspended') {
-                await audioCtx.resume();
-            }
+            // ★デコード用AudioContextを単発で使い捨て、完了後に明示的にcloseしてメモリ解放
+            const tempAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-            audioCtx.decodeAudioData(arrayBuffer, (buffer) => {
+            tempAudioCtx.decodeAudioData(arrayBuffer, (buffer) => {
                 const channelData = buffer.getChannelData(0);
                 const floatArray = new Float32Array(channelData); 
                 
@@ -271,14 +313,16 @@
                     index: currentIndex
                 });
 
+                tempAudioCtx.close(); // 明示的に解放
                 processNextQueue();
             }, (err) => {
                 log("デコードエラー: " + err.message);
+                tempAudioCtx.close();
             });
-        }; // rec.onstop 閉じ
+        }; 
 
-        rec.start(1000); // 👈 復元：録音開始命令
-    }; // 👈 復元：startSegment 関数の閉じ
+        rec.start(1000); // 1秒ごとにondataavailableを発生させる
+    }; 
 
     startBtn.onclick = async () => {
         startBtn.classList.add('recording-active');
