@@ -43,23 +43,53 @@
     .error-status-text { color: #d32f2f !important; border: 3px solid #d32f2f !important; background: #ffffff !important; box-shadow: 0 0 15px rgba(211, 47, 47, 0.2) !important; }
 
     .qr-container { margin: 20px auto; padding: 15px; background: white; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); display: inline-block; text-align: center; }
-    .qr-container svg { display: block; margin: 0 auto; width: 200px; height: 200px; }
+    .qr-container svg, .qr-container img { display: block; margin: 0 auto; width: 200px; height: 200px; }
+
+    /* Windows警告エリア用スタイル */
+    #windows-notice {
+        display: none;
+        background: white;
+        padding: 25px 20px;
+        border-radius: 12px;
+        border: 2px solid #ff9800;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        max-width: 400px;
+        margin: 20px auto;
+        text-align: left;
+    }
+    #windows-notice h2 { font-size: 1.2rem; color: #d32f2f; margin-top: 0; text-align: center; }
+    #windows-notice p { font-size: 0.9rem; color: #444; line-height: 1.6; }
 </style>
 </head>
 <body>
     <div class="ver-container">
-        <span id="version-tag">Ver. 1.1.17</span>
+        <span id="version-tag">Ver. 1.1.18 (Android Recommended)</span>
     </div>
 
     <h1>AI議事録レコーダー（運営会議用）</h1>
-    <button id="recover-btn" style="background: #ff9800; color: white; display: none;">
-        💾 未送信の音声データを端末に保存する
-    </button>
-    
-    <button id="start">● 録音開始</button>
-    <button id="stop" disabled>■ 停止・議事録作成</button>
-    <!-- 【修正】初期表示テキストを準備中にして誤解を防ぐ -->
-    <p id="status">システム初期化中（スプレッドシート作成中）...</p>
+
+    <!-- 【新規追加】Windows検出時に表示する案内エリア -->
+    <div id="windows-notice">
+        <h2>⚠️ Windows非対応のお知らせ</h2>
+        <p>Windows環境下のWebブラウザ（Chrome/Edge等）では、システムの構造上の制限により長時間録音時にメモリが不足する現象が発生することが判明いたしました。</p>
+        <p>本アプリを<strong>Androidスマートフォン・タブレット等のモバイル環境</strong>で動作させてください。</p>
+        <hr style="border:0; border-top:1px dashed #ccc; margin:15px 0;">
+        <p style="text-align:center; font-weight:bold; margin-bottom:10px;">
+            📱 スマホで以下のQRコードをスキャンして開いてください
+        </p>
+        <div id="app-qr-area" class="qr-container" style="display:block;"></div>
+    </div>
+
+    <!-- 既存のアプリアレイ -->
+    <div id="app-main-content">
+        <button id="recover-btn" style="background: #ff9800; color: white; display: none;">
+            💾 未送信の音声データを端末に保存する
+        </button>
+        
+        <button id="start">● 録音開始</button>
+        <button id="stop" disabled>■ 停止・議事録作成</button>
+        <p id="status">システム初期化中（スプレッドシート作成中）...</p>
+    </div>
 
     <audio id="silent-audio" loop>
         <source src="data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=" type="audio/wav">
@@ -93,6 +123,14 @@
         console.log(msg);
         logMessages.push(`[Log] ${msg}`);
         if (logMessages.length > 10) logMessages.shift();
+    }
+
+    // Windows OS 判定関数
+    function isWindowsEnvironment() {
+        if (navigator.userAgentData && navigator.userAgentData.platform) {
+            return navigator.userAgentData.platform === "Windows";
+        }
+        return navigator.userAgent.indexOf("Win") !== -1;
     }
 
     const requestWakeLock = async () => {
@@ -222,7 +260,19 @@
     };
 
     window.onload = () => {
-        
+        // Windows環境チェック
+        if (isWindowsEnvironment()) {
+            document.getElementById('app-main-content').style.display = 'none';
+            const noticeArea = document.getElementById('windows-notice');
+            noticeArea.style.display = 'block';
+            
+            // アプリ自身のURLをQR化
+            const currentUrl = window.location.href;
+            document.getElementById('app-qr-area').innerHTML = generateQRishest(currentUrl);
+            log("Windows環境を検知：スマホ誘導画面を表示しました");
+            return; // バックグラウンド処理・GAS初期化をスキップ
+        }
+
         // 起動時に一瞬だけ大きなメモリダミー領域を確保して破棄し、V8の清掃モードを起動する
         let dummy = new ArrayBuffer(500 * 1024 * 1024); // 100MBのダミー
         dummy = null; // 即座に参照を切って清掃対象にする
@@ -275,10 +325,10 @@
             }, (err) => {
                 log("デコードエラー: " + err.message);
             });
-        }; // rec.onstop 閉じ
+        };
 
-        rec.start(1000); // 👈 復元：録音開始命令
-    }; // 👈 復元：startSegment 関数の閉じ
+        rec.start(1000);
+    };
 
     startBtn.onclick = async () => {
         startBtn.classList.add('recording-active');
